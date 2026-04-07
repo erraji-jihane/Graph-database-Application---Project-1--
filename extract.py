@@ -18,6 +18,7 @@ DEBUG_DIR = "debug_images"
 SAVE_DEBUG = True
 
 EXPECTED_BOXES = {1: 47, 2: 52}
+PROCESS_ALL_PAGES_EXCEPT_LAST = True  # NEW: Skip last page
 
 TESS_PATHS = [
     r"C:\Program Files\Tesseract-OCR\tesseract.exe",
@@ -376,14 +377,21 @@ def parse_box_text(raw: str) -> dict | None:
     return rec
 
 # ══════════════════════════════════════════════════════════════════════
-# Extraction
+# Extraction (UPDATED - SKIPS LAST PAGE)
 # ══════════════════════════════════════════════════════════════════════
 
 def extract_courses(pdf_path: str) -> list[dict]:
     pages = pdf_to_images(pdf_path)
     all_records = []
 
-    for page_num, bgr in pages:
+    # NEW: Skip last page if configured
+    pages_to_process = pages[:-1] if PROCESS_ALL_PAGES_EXCEPT_LAST else pages
+    total_pages = len(pages)
+    pages_processed = len(pages_to_process)
+    
+    print(f"  📄 Processing {pages_processed}/{total_pages} pages (skipping last page)")
+    
+    for page_num, bgr in pages_to_process:
         print(f"\n  Page {page_num}:")
         boxes = find_boxes(bgr, page_num)
         print(f"    {len(boxes)} candidate boxes detected (expected {EXPECTED_BOXES.get(page_num, 'N/A')})")
@@ -580,6 +588,7 @@ def write_excel(filename: str, rows: list[dict], title: str = None):
 if __name__ == "__main__":
     print("=" * 60)
     print("  BSCSC — PDF → Images → OCR → Excel (with CODE-BASED CREDITS)")
+    print("  🆕 SKIPS LAST PAGE automatically!")
     print("=" * 60)
 
     configure_tesseract()

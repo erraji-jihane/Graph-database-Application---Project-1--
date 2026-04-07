@@ -1,3 +1,0 @@
-Detected boxes: 290
-Expected boxes: N/A
-
