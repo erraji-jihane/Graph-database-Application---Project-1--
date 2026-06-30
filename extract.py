@@ -1,41 +1,16 @@
 import os
 import re
 import json
+import base64
 from pathlib import Path
+from typing import Dict, List, Any
 
-import fitz  # PyMuPDF
-import openpyxl
-from openpyxl.styles import PatternFill, Font, Alignment
-from openpyxl.utils import get_column_letter
+import pandas as pd
+import anthropic
 from dotenv import load_dotenv
-from google import genai
 
-
-# ============================================================
-# CONFIG
-# ============================================================
-BASE_DIR = Path(__file__).resolve().parent
-load_dotenv(BASE_DIR / ".env")
-
-PDF_PATH = BASE_DIR / "BSCSC_Course-Sequence_Catalog 2023-2025_Dec_2023.pdf"
-OUTPUT_DIR = BASE_DIR / "output_xlsx"
-MODEL_NAME = "gemini-2.5-flash"
-
-EXPECTED_FILES = {
-    "Mathematics": "Mathematics.xlsx",
-    "ComputerScience": "ComputerScience.xlsx",
-    "ScienceEngineering": "ScienceEngineering.xlsx",
-    "GenEd": "GenEd.xlsx",
-    "Elective": "Elective.xlsx",
-    "Minor": "Minor.xlsx",
-    "ACS": "ACS.xlsx",
-    "AI": "AI.xlsx",
-    "BDA": "BDA.xlsx",
-    "CSys": "CSys.xlsx",
-    "SE": "SE.xlsx",
-}
-
-REQUIRED_COLUMNS = [
+# these are the columns we expect in every course sheet
+EXPECTED_COLUMNS = [
     "Course Code",
     "Course Title",
     "Course Credits",
@@ -43,534 +18,456 @@ REQUIRED_COLUMNS = [
     "Category",
 ]
 
-SPEC_BUCKETS = ["ACS", "AI", "BDA", "CSys", "SE"]
+# hardcoded some courses which pre-requisites are not detected 
+HARDCODED_PREREQ_FIXES = {
+    "CSC2305": "CSC2302, PHY1402",   
+    "CSC3374": "CSC3351, CSC3326",  
+    "EGR2302": "MTH1303",           
+    "EGR4300": "FRN3210, ENG2303",   
+    "EGR4402": "FRN3210, ENG2303",  
+}
 
-OUTPUT_DIR.mkdir(exist_ok=True)
-
-
-# ============================================================
-# CLEANUP RULES ONLY (post-extraction cleanup)
-# ============================================================
-# These are not used to create the dataset from scratch.
-# They are only used to clean mismatched prerequisite values after extraction.
-CLEAN_PREREQ_OVERRIDES = {
-    # Mathematics
-    "MTH1303": "NONE",
-    "MTH1304": "NONE",
-    "MTH2301": "MTH1303",
-    "MTH2320": "MTH2301, MTH1304",
-    "MTH3301": "MTH2320",
-
-    # Science / Engineering
-    "PHY1401": "NONE",
-    "PHY1402": "PHY1401",
-    "EGR2302": "PHY1401",
-
-    # Main CS core
-    "CSC1401": "NONE",
-    "CSC2302": "CSC1401",
-    "CSC2306": "CSC2302",
-    "CSC2305": "CSC2302",
-    "CSC3315": "CSC2306",
-    "CSC3323": "CSC2306",
-    "CSC3324": "CSC2306",
-    "CSC3326": "CSC3323",
-    "CSC3351": "CSC3315, CSC2305",
-    "CSC3374": "CSC3351",
-    "CSC3371": "CSC3323",
-
-    # Page 2 specialization cleanup
-    "CSC3309": "CSC2306, CSC3323, MTH3301",
-    "CSC4308": "CSC3371",
-    "CSC3328": "CSC3351",
-    "CSC4399": "depends on the topic",
-
-    "CSC3347": "CSC3308 or CSC3309",
-    "CSC3310": "CSC3308 or CSC3309",
-    "CSC3311": "CSC3308 or CSC3309",
-    "CSC3348": "CSC3308 or CSC3309",
-
-    "CSC3331": "CSC3326",
-    "CSC4352": "CSC3331",
-    "CSC3329": "CSC3371",
-    "CSC3346": "CSC3326",
-    "CSC3349": "CSC3326",
-    "CSC4351": "MTH3301",
-
-    "CSC3373": "CSC3351, CSC3371",
-    "CSC3376": "CSC3351",
-
-    "CSC4307": "CSC3326, CSC3351",
-    "CSC4309": "CSC3374",
-    "CSC3357": "CSC2306",
-    "CSC3358": "CSC3326",
-    "CSC3359": "CSC2306",
-    "CSC4306": "CSC3324",
+# output file names for each sheet
+OUTPUT_FILES = {
+    "math": "Mathematics.xlsx",
+    "computer_science": "ComputerScience.xlsx",
+    "science_engineering": "ScienceEngineering.xlsx",
+    "gen_ed": "GenEd.xlsx",
+    "elective": "Elective.xlsx",
+    "ai": "AI.xlsx",
+    "acs": "ACS.xlsx",
+    "bda": "BDA.xlsx",
+    "csys": "CSys.xlsx",
+    "se": "SE.xlsx",
+    "minor": "Minor.xlsx",
 }
 
 
-# ============================================================
-# HELPERS
-# ============================================================
-def normalize_text(value):
-    if value is None:
-        return "NONE"
-    value = str(value).strip()
-    if not value or value.lower() in {"nan", "null", "none", "n/a"}:
-        return "NONE"
-    return value
+def pdf_to_base64(pdf_path: Path) -> str:
+    # read the pdf file as bytes and encode it to base64 so claude can read it
+    return base64.b64encode(pdf_path.read_bytes()).decode("utf-8")
 
 
-def normalize_course_code(code):
-    code = normalize_text(code).upper().replace(" ", "")
-    code = code.replace("^", "")
-    return code
-
-
-def infer_credits_from_code(course_code, current_value="NONE"):
-    """
-    Credit = 2nd digit of the 4-digit numeric part.
-    Examples:
-      CSC1401 -> 4
-      CSC2302 -> 3
-      MTH1303 -> 3
-    """
-    current_value = normalize_text(current_value)
-
-    # If already a clean numeric value, keep it
-    if current_value.isdigit():
-        return current_value
-
-    code = normalize_course_code(course_code)
-    match = re.search(r"[A-Z]{2,4}(\d{4})", code)
-    if not match:
-        return "NONE"
-
-    digits = match.group(1)
-    return digits[1]
-
-
-def extract_json_from_text(text):
+def extract_json_from_text(text: str) -> Dict[str, Any]:
+    # try to parse the raw text from claude as json
     text = text.strip()
-
-    fence_match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL | re.IGNORECASE)
-    if fence_match:
-        text = fence_match.group(1).strip()
-
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
 
+    # if claude wraps the json in ```json ... ``` then we want to remove that
+    match = re.search(r"```json\s*(\{.*\})\s*```", text, re.DOTALL)
+    if match:
+        return json.loads(match.group(1))
+
+    # if the json is just inside a big text block, we can find { ... }
     start = text.find("{")
     end = text.rfind("}")
     if start != -1 and end != -1 and end > start:
         return json.loads(text[start:end + 1])
 
-    raise ValueError("Could not parse JSON from Gemini response.")
+    # if claude did not return valid json
+    raise ValueError("Claude response did not contain valid JSON.")
 
 
-def extract_pdf_text(pdf_path):
-    doc = fitz.open(str(pdf_path))
-    pages = []
-    for i in range(len(doc)):
-        text = doc.load_page(i).get_text("text")
-        pages.append(f"\n===== PAGE {i+1} =====\n{text}")
-    doc.close()
-    return "\n".join(pages)
+def normalize_code(value: Any) -> str:     # uppercase and without spaces
+    if value is None:
+        return "NONE"
+    s = str(value).strip()
+    if not s:
+        return "NONE"
+    return s.replace(" ", "").upper()
 
 
-def ensure_required_columns(records):
-    cleaned = []
-    for item in records:
-        row = {}
-        for col in REQUIRED_COLUMNS:
-            row[col] = normalize_text(item.get(col, "NONE"))
-        cleaned.append(row)
-    return cleaned
+def normalize_text(value: Any) -> str:
+    # if it's missing values we use "NONE"
+    if value is None:
+        return "NONE"
+    s = str(value).strip()
+    return s if s else "NONE"
 
 
-def deduplicate_rows(records):
-    seen = set()
-    output = []
-    for row in records:
-        key = tuple(normalize_text(row.get(c, "NONE")) for c in REQUIRED_COLUMNS)
-        if key not in seen:
-            seen.add(key)
-            output.append(row)
-    return output
+def normalize_prereq(value: Any) -> str:
+    # Normalizing prerequisites into clear string (removing extra spaces) 
+    if value is None:
+        return "NONE"
+    s = str(value).strip()
+    if not s:
+        return "NONE"
+    s = re.sub(r"\s+", " ", s)   # compress multiple spaces into one
+    return s
 
 
-def build_minor_rows():
-    return [
-        {
-            "Course Code": f"course{i}",
-            "Course Title": "EMPTY",
-            "Course Credits": "3",
-            "Prerequisites": "EMPTY",
-            "Category": "Minor",
-        }
-        for i in range(1, 6)
-    ]
+def normalize_credits(value: Any) -> int:
+    # extracting course credit form course code 
+    # if it's missing or no digits, we return 0
+    if value is None:
+        return 0
+    s = str(value).strip()
+    if not s:
+        return 0
+    match = re.search(r"\d+", s)
+    return int(match.group()) if match else 0
 
 
-# ============================================================
-# PROMPT
-# ============================================================
-def build_prompt(raw_text):
-    return f"""
-You are extracting structured academic course data from a BSCSC flowchart PDF.
-
-Return ONLY valid JSON.
-
-Use EXACTLY these top-level keys:
-{{
-  "Mathematics": [],
-  "ComputerScience": [],
-  "ScienceEngineering": [],
-  "GenEd": [],
-  "Elective": [],
-  "Minor": [],
-  "ACS": [],
-  "AI": [],
-  "BDA": [],
-  "CSys": [],
-  "SE": []
-}}
-
-Each row must be an object with EXACTLY these keys:
-{{
-  "Course Code": "...",
-  "Course Title": "...",
-  "Course Credits": "...",
-  "Prerequisites": "...",
-  "Category": "..."
-}}
-
-Rules:
-1. Use only information from the PDF text.
-2. If information is missing, put "NONE".
-3. Do NOT invent courses.
-4. For grouped blocks with multiple courses, create one row per course.
-5. Preserve prerequisite text as clearly as possible.
-
-Category rules:
-- Mathematics:
-  only math courses from Area 1(a)
-  Category = "Mathematics"
-
-- ComputerScience:
-  include ALL computer science courses appearing in the PDF,
-  including:
-    a) main page 1 CS core courses
-    b) specialization courses from page 2
-    c) computing elective placeholder
-    d) specialization course placeholders from page 1
-  Category must be ONLY one of:
-    "Required", "Specialization", "Computing elective"
-
-- ScienceEngineering:
-  include page 1 science and engineering courses
-  Category = "Science" or "Engineering"
-
-- GenEd:
-  include GenEd page 1 courses and listed options
-  Category must be "GenEd" or "GenEd_BlockTitle"
-  Examples:
-    "GenEd_Arabic"
-    "GenEd_Humanities"
-    "GenEd_French"
-    "GenEd_SocialSciences"
-    "GenEd_HistoryOrPoliticalScience"
-    "GenEd_ArtAppreciationCreation"
-    "GenEd_CivicEngagement"
-
-- Elective:
-  include elective options from page 2 specialization sections
-  Category = "elective"
-
-- Minor:
-  create exactly 5 rows:
-    course1, course2, course3, course4, course5
-  Course Title = EMPTY
-  Prerequisites = EMPTY
-  Course Credits = 3
-  Category = Minor
-
-- ACS / AI / BDA / CSys / SE:
-  specialization files from page 2
-  required courses => Category = "Required"
-  elective choices => Category = "Optional"
-
-Important:
-- Include ALL "Choose 1" specialization options in the specialization files.
-- Do not skip courses just because credits are missing.
-- Return JSON only.
-
-PDF text:
-{raw_text}
-""".strip()
+def ensure_minor_rows() -> List[Dict[str, Any]]:
+    # the minor sheet always has 5 rows, named COURSE1 to COURSE5
+    rows = []
+    for i in range(1, 6):
+        rows.append(
+            {
+                "Course Code": f"COURSE{i}",
+                "Course Title": "EMPTY",   # not filled in the pdf anyway
+                "Course Credits": 3,        # all minors are 3 credits
+                "Prerequisites": "EMPTY",
+                "Category": "Minor",
+            }
+        )
+    return rows
 
 
-# ============================================================
-# GEMINI CALL
-# ============================================================
-def call_gemini(pdf_path):
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        raise EnvironmentError("GEMINI_API_KEY not found in .env or environment.")
+def normalize_rows(sheet_key: str, rows: List[Dict[str, Any]]) -> pd.DataFrame:
+    # take the raw course rows and clean them up
+    cleaned: List[Dict[str, Any]] = []
 
-    client = genai.Client(api_key=api_key)
-    raw_text = extract_pdf_text(pdf_path)
-    prompt = build_prompt(raw_text)
+    for row in rows:
+        code = normalize_code(row.get("Course Code"))
+        title = normalize_text(row.get("Course Title"))
+        credits = normalize_credits(row.get("Course Credits"))
+        prereq = normalize_prereq(row.get("Prerequisites"))
+        category = normalize_text(row.get("Category"))
 
-    response = client.models.generate_content(
-        model=MODEL_NAME,
-        contents=prompt,
-    )
+        # apply the hardcoded fixes for a few courses (the 5 ones that we hardcoded at the start since we found some problems with their extraction)
+        if code in HARDCODED_PREREQ_FIXES:
+            prereq = HARDCODED_PREREQ_FIXES[code]
 
-    data = extract_json_from_text(response.text)
-    return data
+        cleaned.append(
+            {
+                "Course Code": code,
+                "Course Title": title,
+                "Course Credits": credits,
+                "Prerequisites": prereq,
+                "Category": category,
+            }
+        )
+
+    # if this is the minor sheet, we always use the 5 standard rows
+    if sheet_key == "minor":
+        cleaned = ensure_minor_rows()
+
+    df = pd.DataFrame(cleaned)
+
+    # if there are no rows we still want the expected columns
+    if df.empty:
+        df = pd.DataFrame(columns=EXPECTED_COLUMNS)
+
+    # make sure all expected columns exist
+    for col in EXPECTED_COLUMNS:
+        if col not in df.columns:
+            df[col] = "NONE"
+
+    # reorder columns so they are always the same
+    df = df[EXPECTED_COLUMNS]
+
+    # remove duplicate rows
+    # computer_science should keep only unique (code, category) pairs
+    # other sheets only need unique codes
+    if sheet_key == "computer_science":
+        df = df.drop_duplicates(subset=["Course Code", "Category"], keep="first")
+    else:
+        df = df.drop_duplicates(subset=["Course Code"], keep="first")
+
+    df = df.reset_index(drop=True)
+    return df
 
 
-# ============================================================
-# CLEANUP PIPELINE
-# ============================================================
-def merge_specializations_into_computerscience(final):
-    """
-    Make sure ComputerScience contains all CSC courses,
-    including specialization CSC courses.
-    """
-    cs_rows = final.get("ComputerScience", [])
-    existing_codes = {normalize_course_code(r.get("Course Code", "NONE")) for r in cs_rows}
+def propagate_specialization_rows(data: Dict[str, Any]) -> Dict[str, Any]:
+    # making sure computer_science exists as a list
+    if "computer_science" not in data or not isinstance(data["computer_science"], list):
+        data["computer_science"] = []
 
-    for spec_bucket in SPEC_BUCKETS:
-        for row in final.get(spec_bucket, []):
-            code = normalize_course_code(row.get("Course Code", "NONE"))
-            if not code.startswith("CSC"):
-                continue
+  
+    specialization_keys = ["ai", "acs", "bda", "csys", "se"]
 
-            if code not in existing_codes:
-                cs_rows.append({
-                    "Course Code": code,
-                    "Course Title": normalize_text(row.get("Course Title", "NONE")),
-                    "Course Credits": infer_credits_from_code(code, row.get("Course Credits", "NONE")),
-                    "Prerequisites": normalize_text(row.get("Prerequisites", "NONE")),
-                    "Category": "Specialization",
-                })
-                existing_codes.add(code)
+    # keeping track of which (code, category) pairs already exist in computer_science
+    existing_pairs = set()
+    for row in data["computer_science"]:
+        code = normalize_code(row.get("Course Code"))
+        category = normalize_text(row.get("Category"))
+        existing_pairs.add((code, category))
 
-    final["ComputerScience"] = deduplicate_rows(ensure_required_columns(cs_rows))
-    return final
+    # we also add the course in the specialization to the computer science excel file
+    for spec_key in specialization_keys:
+        rows = data.get(spec_key, [])
+        if not isinstance(rows, list):
+            continue
 
-
-def rebuild_elective_from_specializations(final):
-    """
-    Rebuild Elective.xlsx from specialization optional courses.
-    """
-    elective_rows = []
-    seen = set()
-
-    for spec_bucket in SPEC_BUCKETS:
-        for row in final.get(spec_bucket, []):
-            cat = normalize_text(row.get("Category", "NONE")).lower()
-            code = normalize_course_code(row.get("Course Code", "NONE"))
-            if cat not in {"optional", "elective"}:
-                continue
+        for row in rows:
+            code = normalize_code(row.get("Course Code"))
             if code == "NONE":
                 continue
 
-            key = (code, normalize_text(row.get("Course Title", "NONE")))
-            if key in seen:
-                continue
-            seen.add(key)
+            pair = (code, "Specialization")
+            if pair in existing_pairs:
+                continue   # avoid adding it twice
 
-            elective_rows.append({
+            data["computer_science"].append(
+                {
+                    "Course Code": code,
+                    "Course Title": normalize_text(row.get("Course Title")),
+                    "Course Credits": normalize_credits(row.get("Course Credits")),
+                    "Prerequisites": normalize_prereq(row.get("Prerequisites")),
+                    "Category": "Specialization",
+                }
+            )
+            existing_pairs.add(pair)
+
+    return data
+
+
+def move_egr_courses_to_science_engineering(data: Dict[str, Any]) -> Dict[str, Any]:
+    # make sure computer_science exists as a list
+    if "computer_science" not in data or not isinstance(data["computer_science"], list):
+        data["computer_science"] = []
+
+    if "science_engineering" not in data or not isinstance(data["science_engineering"], list):
+        data["science_engineering"] = []
+
+    # track which codes are already in science_engineering
+    existing_se_codes = {
+        normalize_code(row.get("Course Code"))
+        for row in data["science_engineering"]
+        if isinstance(row, dict)
+    }
+
+    remaining_cs = []
+
+    # move any EGR‑prefixed course from cs to science_engineering
+    for row in data["computer_science"]:
+        code = normalize_code(row.get("Course Code"))
+
+        if code.startswith("EGR"):
+            moved_row = {
                 "Course Code": code,
-                "Course Title": normalize_text(row.get("Course Title", "NONE")),
-                "Course Credits": infer_credits_from_code(code, row.get("Course Credits", "NONE")),
-                "Prerequisites": normalize_text(row.get("Prerequisites", "NONE")),
-                "Category": "elective",
-            })
+                "Course Title": normalize_text(row.get("Course Title")),
+                "Course Credits": normalize_credits(row.get("Course Credits")),
+                "Prerequisites": normalize_prereq(row.get("Prerequisites")),
+                "Category": "Engineering",
+            }
 
-    final["Elective"] = deduplicate_rows(ensure_required_columns(elective_rows))
-    return final
+            if code not in existing_se_codes:
+                data["science_engineering"].append(moved_row)
+                existing_se_codes.add(code)
+        else:
+            remaining_cs.append(row)
 
-
-def apply_cleanup_rules(final):
-    for bucket, rows in final.items():
-        for row in rows:
-            code = normalize_course_code(row.get("Course Code", "NONE"))
-            row["Course Code"] = code
-
-            # credits from course code
-            row["Course Credits"] = infer_credits_from_code(code, row.get("Course Credits", "NONE"))
-
-            # cleanup prerequisites only after extraction
-            if code in CLEAN_PREREQ_OVERRIDES:
-                row["Prerequisites"] = CLEAN_PREREQ_OVERRIDES[code]
-            else:
-                row["Prerequisites"] = normalize_text(row.get("Prerequisites", "NONE"))
-
-            row["Course Title"] = normalize_text(row.get("Course Title", "NONE"))
-            row["Category"] = normalize_text(row.get("Category", "NONE"))
-
-    return final
+    # after moving EGR courses, cs only has non‑EGR courses
+    data["computer_science"] = remaining_cs
+    return data
 
 
-def normalize_computerscience_categories(final):
-    """
-    Restrict ComputerScience categories to:
-    Required / Specialization / Computing elective
-    """
-    for row in final.get("ComputerScience", []):
-        code = normalize_course_code(row.get("Course Code", "NONE"))
-        title = normalize_text(row.get("Course Title", "NONE"))
-        cat = normalize_text(row.get("Category", "NONE")).lower()
-
-        if title == "Computing Elective":
-            row["Category"] = "Computing elective"
-        elif title.startswith("Specialization Course"):
-            row["Category"] = "Specialization"
-        elif code.startswith("CSC") and cat in {"optional", "elective", "specialization"}:
-            row["Category"] = "Specialization"
-        elif code.startswith("CSC"):
-            row["Category"] = "Required"
-
-    return final
+def build_prompt() -> str:
+    # this is the system prompt that claude will use to extract data
+    # it tells claude what json structure to return and how to format the data
+    return """
+You are extracting structured course data from ONE PDF:
+the BSCSC course sequence PDF.
 
 
-def postprocess_data(data):
-    final = {}
-
-    for bucket in EXPECTED_FILES.keys():
-        records = data.get(bucket, [])
-        if not isinstance(records, list):
-            records = []
-        records = ensure_required_columns(records)
-        records = deduplicate_rows(records)
-        final[bucket] = records
-
-    # Minor placeholder rows
-    if not final["Minor"]:
-        final["Minor"] = build_minor_rows()
-
-    # Keep page 1 placeholders if Gemini misses them
-    existing_titles = {normalize_text(r.get("Course Title", "NONE")) for r in final["ComputerScience"]}
-    placeholders = [
-        {
-            "Course Code": "NONE",
-            "Course Title": "Computing Elective",
-            "Course Credits": "3",
-            "Prerequisites": "NONE",
-            "Category": "Computing elective",
-        },
-        {
-            "Course Code": "NONE",
-            "Course Title": "Specialization Course 1",
-            "Course Credits": "NONE",
-            "Prerequisites": "NONE",
-            "Category": "Specialization",
-        },
-        {
-            "Course Code": "NONE",
-            "Course Title": "Specialization Course 2",
-            "Course Credits": "NONE",
-            "Prerequisites": "NONE",
-            "Category": "Specialization",
-        },
-        {
-            "Course Code": "NONE",
-            "Course Title": "Specialization Course 3",
-            "Course Credits": "NONE",
-            "Prerequisites": "NONE",
-            "Category": "Specialization",
-        },
-    ]
-    for row in placeholders:
-        if row["Course Title"] not in existing_titles:
-            final["ComputerScience"].append(row)
-
-    # Merge specialization CSC courses into ComputerScience
-    final = merge_specializations_into_computerscience(final)
-
-    # Rebuild Elective from specialization optional courses
-    final = rebuild_elective_from_specializations(final)
-
-    # Apply post-extraction cleanup
-    final = apply_cleanup_rules(final)
-
-    # Normalize CS category values
-    final = normalize_computerscience_categories(final)
-
-    # Final dedupe
-    for bucket in final:
-        final[bucket] = deduplicate_rows(ensure_required_columns(final[bucket]))
-
-    return final
+Your job is to return ONE valid JSON object only.
+Do not add explanations.
+Do not wrap the JSON in markdown.
 
 
-# ============================================================
-# EXCEL WRITER
-# ============================================================
-HDR_FILL = PatternFill("solid", fgColor="1F497D")
-HDR_FONT = Font(bold=True, color="FFFFFF", size=11)
-ALT_FILL = PatternFill("solid", fgColor="DCE6F1")
-COL_WIDTHS = [16, 60, 15, 40, 24]
+Return this exact top-level structure:
+{
+  "math": [...],
+  "computer_science": [...],
+  "science_engineering": [...],
+  "gen_ed": [...],
+  "elective": [...],
+  "ai": [...],
+  "acs": [...],
+  "bda": [...],
+  "csys": [...],
+  "se": [...],
+  "minor": [...]
+}
 
 
-def write_excel(filename, rows, title="Sheet1"):
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = title[:31]
-
-    ws.append(REQUIRED_COLUMNS)
-
-    for col in range(1, 6):
-        cell = ws.cell(1, col)
-        cell.font = HDR_FONT
-        cell.fill = HDR_FILL
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-    ws.row_dimensions[1].height = 20
-
-    for i, row in enumerate(rows, start=2):
-        ws.append([row.get(col, "NONE") for col in REQUIRED_COLUMNS])
-
-        if i % 2 == 0:
-            for col in range(1, 6):
-                ws.cell(i, col).fill = ALT_FILL
-
-        for col in range(1, 6):
-            ws.cell(i, col).alignment = Alignment(wrap_text=True, vertical="top")
-
-    for idx, width in enumerate(COL_WIDTHS, 1):
-        ws.column_dimensions[get_column_letter(idx)].width = width
-
-    ws.freeze_panes = "A2"
-    wb.save(str(OUTPUT_DIR / filename))
+For every row in every array, use exactly these keys:
+- "Course Code"
+- "Course Title"
+- "Course Credits"
+- "Prerequisites"
+- "Category"
 
 
-# ============================================================
-# MAIN
-# ============================================================
-def main():
-    if not PDF_PATH.exists():
-        raise FileNotFoundError(f"PDF not found: {PDF_PATH}")
+Extraction rules:
+1. Use only the PDF content.
+2. If any value is missing, use "NONE".
+3. For blocks containing several courses, create one row per course.
+4. Course codes must not contain spaces. Example: "CSC 3309" becomes "CSC3309".
+5. Course credits must be numeric.
 
-    print(f"Using PDF: {PDF_PATH}")
-    print("Calling Gemini API...")
 
-    raw_data = call_gemini(PDF_PATH)
-    final = postprocess_data(raw_data)
+6. Mathematics sheet:
+- include math courses from the flowchart
+- category must be exactly "Mathematics"
 
-    print("Saving XLSX files...")
-    for bucket, filename in EXPECTED_FILES.items():
-        rows = final.get(bucket, [])
-        write_excel(filename, rows, title=bucket)
-        print(f"Saved: {OUTPUT_DIR / filename} ({len(rows)} rows)")
 
-    print("\nDone.")
-    print(f"Files saved in: {OUTPUT_DIR.resolve()}")
+7. ScienceEngineering sheet:
+- include science and engineering courses
+- category must be exactly either "Science" or "Engineering"
+- if a block lists multiple courses like BIO 1401, BIO 1402, CHE 1401, create one row per course
+
+
+8. ComputerScience sheet:
+- include all core/required computer science courses from page 1
+- include specialization courses too if visible
+- do NOT place EGR courses in computer_science
+- category must be one of:
+  "Required", "Specialization", "Computing elective"
+
+
+9. Elective sheet:
+- include specialization elective courses from page 2
+- category must be exactly "elective"
+
+
+10. Specialization sheets:
+- create separate sheets for ai, acs, bda, csys, se
+- categories must be exactly "Required" or "Optional"
+
+
+11. GenEd sheet:
+- include GenEd courses from page 1
+- category should be either "GenEd" or a block category like:
+  "GenEd_Arabic", "GenEd_French", "GenEd_Humanities",
+  "GenEd_Art", "GenEd_HistoryPoliticalScience",
+  "GenEd_SocialSciences", "GenEd_CivicEngagement"
+
+
+12. Minor sheet:
+- return exactly 5 rows only:
+  COURSE1, COURSE2, COURSE3, COURSE4, COURSE5
+- Course Title = EMPTY
+- Prerequisites = EMPTY
+- Course Credits = 3
+- Category = Minor
+
+
+13. Use visible prerequisite arrows and prerequisite text whenever available.
+14. For specialization prerequisites, preserve expressions like:
+- "CSC2306, CSC3323, MTH3301"
+- "CSC3308 or CSC3309"
+- "depends on the topic"
+
+
+Return JSON only.
+""".strip()
+
+
+def call_claude(course_pdf: Path, model: str) -> Dict[str, Any]:
+    # set up the anthropic client with the api key
+    
+    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"]) #from env
+
+    # send the pdf and the prompt to claude (base64 used as claude can read it)
+    # we use base64 because claude can read documents as base64
+    response = client.messages.create(
+        model=model,
+        max_tokens=12000,
+        temperature=0,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "document",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "application/pdf",
+                            "data": pdf_to_base64(course_pdf),
+                        },
+                    },
+                    {
+                        "type": "text",
+                        "text": build_prompt(),
+                    },
+                ],
+            }
+        ],
+    )
+
+    # collect all the text parts from claude's response
+    text_parts = []
+    for block in response.content:
+        if getattr(block, "type", None) == "text":
+            text_parts.append(block.text)
+
+    full_text = "\n".join(text_parts).strip()
+
+    # parse the text into a json object
+    # this is the main data we get from claude
+    return extract_json_from_text(full_text)
+
+
+def save_outputs(data: Dict[str, Any], out_dir: Path) -> None:
+    # create the output directory if it doesn't exist (for teh excel files)
+    
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # putting the specialization courses into the cs list
+    data = propagate_specialization_rows(data)
+
+    # moving EGR courses from cs to science_engineering
+    data = move_egr_courses_to_science_engineering(data)
+
+    # for each sheet key, clean the rows and save to an excel file
+    for key, filename in OUTPUT_FILES.items():
+        rows = data.get(key, [])
+        df = normalize_rows(key, rows)
+        output_path = out_dir / filename
+        df.to_excel(output_path, index=False)
+        print(f"Saved: {output_path}")
+
+
+def main() -> None:
+    # load the environment variables (api)
+    load_dotenv()
+
+    # this is the anthropic api key from the .env file
+    api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+
+    if not api_key:
+        raise EnvironmentError("ANTHROPIC_API_KEY is missing. Put it in your .env file.")
+
+    # set up the directory where the script is running
+    base_dir = Path(__file__).resolve().parent
+
+    
+    course_pdf = base_dir / "BSCSC_Course-Sequence_Catalog 2023-2025_Dec_2023.pdf"
+
+    # output will go one level up in the "output" folder
+    out_dir = (base_dir.parent / "output").resolve()
+
+    # handling pdf not found error
+    if not course_pdf.exists():
+        raise FileNotFoundError(f"Missing course PDF: {course_pdf}")
+
+    # choosing the claude model from env, default to sonnet‑4‑6
+    model = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6").strip()
+
+    print(f"Using model: {model}")
+    print("Sending PDF to Claude...")
+    data = call_claude(course_pdf, model)
+    print("Claude response parsed successfully.")
+
+    # saving all the cleaned sheets to excel files
+    save_outputs(data, out_dir)
+    print(f"Done. Files are in: {out_dir}")
 
 
 if __name__ == "__main__":
